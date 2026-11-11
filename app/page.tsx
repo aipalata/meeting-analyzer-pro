@@ -1,0 +1,75 @@
+'use client';
+import { useEffect, useRef, useState } from 'react';
+import { uploadPresigned } from '@vercel/blob/client';
+import { listMeetings, saveMeeting } from '../lib/store';
+import { validVideo, type Meeting } from '../lib/types';
+import { googleDriveId } from '../lib/cloud';
+
+type DiskStatus = {connected:boolean; configured?:boolean; folder?:string; lastChecked?:string; lastError?:string; scanning?:boolean; results?:{version:string;name:string;createdAt:string;status:'processing'|'done'|'error';stage?:string;notes?:Meeting['notes'];transcript?:string;error?:string}[]};
+const label = { processing:'Обрабатывается', done:'Готово', error:'Ошибка' };
+function Section({title, items}:{title:string;items:string[]}) { return <section className="note"><h3>{title}</h3>{items.length ? <ul>{items.map((item,i)=><li key={i}>{item}</li>)}</ul>:<p>Не отмечены</p>}</section> }
+export default function Home() {
+  const [disk,setDisk] = useState<DiskStatus>({connected:false}); const [diskFolder,setDiskFolder]=useState('disk:/Встречи'); const [diskNotice,setDiskNotice]=useState(''); const [diskSaving,setDiskSaving]=useState(false); const diskFolderLoaded=useRef(false);
+  const [cloudUrl,setCloudUrl] = useState('');
+  const [meetings,setMeetings] = useState<Meeting[]>([]); const [selected,setSelected] = useState<string>();
+  const [apiKey,setApiKey] = useState(''); const [keyStatus,setKeyStatus] = useState<'idle'|'checking'|'valid'|'error'>('idle'); const [keyMessage,setKeyMessage] = useState(''); const [busy,setBusy] = useState(false); const [notice,setNotice] = useState(''); const picker = useRef<HTMLInputElement>(null); const busyRef = useRef(false);
+  useEffect(()=>{ (async()=>{ try { const rows=await listMeetings(); const fixed=await Promise.all(rows.map(async m=>{if(m.status==='processing'){const value:Meeting={...m,status:'error',error:'Обработка прервана. Загрузите файл повторно.'};await saveMeeting(value);return value;}return m;}));setMeetings(fixed);setSelected(fixed[0]?.id); }catch{setNotice('Не удалось открыть историю. Проверьте, разрешено ли хранение данных в браузере.');} })(); },[]);
+  useEffect(()=>{ let active=true; async function refresh(){try{const res=await fetch('/api/yandex/status',{cache:'no-store'});if(res.ok){const data:DiskStatus=await res.json();if(active){setDisk(data);if(data.folder && !diskFolderLoaded.current){setDiskFolder(data.folder);diskFolderLoaded.current=true;}setMeetings(old=>[...old.filter(x=>!x.id.startsWith('yandex:')),...(data.results||[]).map(r=>({id:'yandex:'+r.version,name:r.name,createdAt:r.createdAt,status:r.status,source:'yandex' as const,notes:r.notes,transcript:r.transcript,error:r.error,stage:r.stage==='AI-анализ'?'analyzing' as const:r.stage==='Распознавание речи'?'transcribing' as const:'fetching' as const}))]);}}}catch{ /* retry on next poll */ }} void refresh();const timer=setInterval(refresh,5000);return()=>{active=false;clearInterval(timer);}; },[]);
+  async function saveDisk(event:React.FormEvent<HTMLFormElement>){event.preventDefault();setDiskSaving(true);setDiskNotice('');try{const response=await fetch('/api/yandex/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({folder:diskFolder,apiKey:apiKey.trim()})});const data=await response.json();if(!response.ok) throw new Error(data.error);setDiskNotice('Настройки сохранены. Запускаем проверку папки.');void fetch('/api/yandex/scan',{method:'POST'});}catch(e){setDiskNotice(e instanceof Error?e.message:'Не удалось сохранить настройки.');}finally{setDiskSaving(false);}}
+  async function persist(m: Meeting) { await saveMeeting(m); setMeetings(old=>[m,...old.filter(x=>x.id!==m.id)]); setSelected(m.id); }
+  async function checkKey(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const key=apiKey.trim();
+    if (!/^sk-[A-Za-z0-9_-]{10,250}$/.test(key)) { setKeyStatus('error'); setKeyMessage('Проверьте формат ключа: он должен начинаться с sk-.'); return; }
+    setKeyStatus('checking'); setKeyMessage('Проверяем ключ в OpenAI…');
+    try {
+      const response=await fetch('/api/key-check',{method:'POST',headers:{'x-openai-key':key},cache:'no-store'});
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.error || 'Не удалось проверить ключ.');
+      setKeyStatus('valid'); setKeyMessage('Ключ принят OpenAI. Теперь можно загрузить видео. Баланс и доступ к моделям проверяются при обработке.');
+    } catch(error) {setKeyStatus('error');setKeyMessage(error instanceof Error ? error.message : 'Не удалось проверить ключ.');}
+  }
+  async function handle(file?: File, url?: string) {
+    if ((!file && !url) || busyRef.current) return;
+    if(!/^sk-[A-Za-z0-9_-]{10,250}$/.test(apiKey.trim())){setNotice('Введите действующий API-ключ OpenAI перед обработкой.'); return;}
+    if(file && !validVideo(file.name,file.size)){setNotice('Выберите файл MP4 или WebM размером до 200 МБ.');return;}
+    let cloudId: string | undefined;
+    if(url) {
+      try { cloudId=googleDriveId(url); } catch(error) {setNotice(error instanceof Error ? error.message : 'Проверьте ссылку.');return;}
+      const previous=meetings.find(m=>m.cloudId===cloudId && m.status==='done');
+      if(previous){setSelected(previous.id);setNotice('Эта запись уже обработана. Открыт сохранённый результат.');return;}
+    }
+    busyRef.current=true;setBusy(true);setNotice('');
+    let meeting:Meeting={id:crypto.randomUUID(),name:file?.name || 'Получение файла из Google Drive',createdAt:new Date().toISOString(),status:'processing',source:url?'cloud':'manual',cloudId,stage:'fetching'};
+    try {
+      await persist(meeting);
+      let path: string;
+      if(file) {
+        const ext=file.name.toLowerCase().endsWith('.webm')?'webm':'mp4'; path=`uploads/${meeting.id}.${ext}`;
+        await uploadPresigned(path,file,{access:'private',handleUploadUrl:'/api/upload',contentType:file.type || 'application/octet-stream',multipart:true});
+      } else {
+        const response=await fetch('/api/cloud',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,meetingId:meeting.id})});
+        const data=await response.json(); if(!response.ok) throw new Error(data.error || 'Не удалось получить файл.');
+        path=data.path; meeting={...meeting,name:data.name}; await persist(meeting);
+      }
+      meeting={...meeting,stage:'transcribing'}; await persist(meeting);
+      const response=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/x-ndjson','x-openai-key':apiKey.trim()},body:JSON.stringify({path})});
+      if(!response.ok || !response.body) {const data=await response.json();throw new Error(data.error || 'Не удалось обработать запись.');}
+      const reader=response.body.getReader(); const decoder=new TextDecoder(); let buffer=''; let complete=false;
+      while(true) {
+        const {done,value}=await reader.read(); buffer+=decoder.decode(value,{stream:!done});
+        const lines=buffer.split('\n'); buffer=lines.pop() || '';
+        for(const line of lines){ if(!line) continue; const data=JSON.parse(line); if(data.error) throw new Error(data.error); if(data.stage){meeting={...meeting,stage:data.stage};await persist(meeting);} if(data.result){meeting={...meeting,status:'done',transcript:data.result.transcript,notes:data.result.notes};await persist(meeting);complete=true;} }
+        if(done) break;
+      }
+      if(!complete) throw new Error('Обработка прервалась. Повторите загрузку.');
+    } catch(error){ meeting={...meeting,status:'error',error:error instanceof Error ? error.message : 'Не удалось обработать запись.'};try{await persist(meeting);}catch{setNotice('Не удалось сохранить результат в браузере.');} }
+    finally{busyRef.current=false;setBusy(false);if(picker.current)picker.current.value='';}
+  }
+  const current=meetings.find(m=>m.id===selected);
+  return <main><header><div className="brand"><span className="brandIcon">✳</span><span>meeting notes <small>pro</small></span></div><span className="tag">ДЛЯ ВАШИХ ИДЕЙ</span></header>
+    <div className="intro"><div><p className="eyebrow">МЕНЬШЕ ЗАПИСЫВАТЬ · БОЛЬШЕ ОБСУЖДАТЬ</p><h1>Встреча прошла.<br/><em>Важное осталось.</em></h1><p className="lead">Загрузите запись или добавьте ссылку Google Drive — получите расшифровку и аккуратный конспект встречи.</p></div><div className="art" aria-hidden="true"><span>✦</span><div className="artCard"><i></i><i></i><i></i><i></i></div><b>✳</b></div></div>
+    <div className="workspace"><aside><form className="keyBox" onSubmit={checkKey}><label htmlFor="api-key">Ваш API-ключ OpenAI</label><input id="api-key" type="password" autoComplete="off" spellCheck={false} placeholder="sk-..." value={apiKey} onChange={e=>{setApiKey(e.target.value);setKeyStatus('idle');setKeyMessage('');}} disabled={busy || keyStatus==='checking'}/><button type="submit" className="checkKey" disabled={busy || keyStatus==='checking'}>{keyStatus==='checking'?'Проверяем…':'Проверить ключ'}</button>{keyMessage&&<p className={'keyStatus '+keyStatus} role="status" aria-live="polite">{keyMessage}</p>}<p>Для обычной загрузки ключ хранится только до закрытия страницы. Если включить PRO+, ключ сохраняется на сервере в зашифрованном виде для фоновой обработки. Расходы оплачиваются в вашем аккаунте OpenAI.</p><a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">Где получить ключ ↗</a></form><div className="cloudBox"><strong>Яндекс Диск · PRO+</strong>{!disk.connected?<><p>Подключите папку для автоматического анализа новых видео. Разрешение Яндекса позволяет читать весь Диск.</p><a href="/api/yandex/start">Подключить Яндекс Диск ↗</a>{diskNotice&&<p role="status">{diskNotice}</p>}</>:<><p>Диск подключён. Укажите путь к папке и введите выше ключ OpenAI для фоновой обработки. Ключ хранится зашифрованно на сервере.</p><form onSubmit={saveDisk}><label htmlFor="disk-folder">Папка на Диске</label><input id="disk-folder" value={diskFolder} onChange={e=>setDiskFolder(e.target.value)} required/><button disabled={diskSaving} type="submit">Сохранить и проверить</button></form>{disk.configured&&<><p>Папка: {disk.folder}. Автопроверка — раз в сутки; за один запуск обрабатывается одна запись.</p><button type="button" disabled={disk.scanning} onClick={()=>{setDiskNotice('Проверяем папку…');void fetch('/api/yandex/scan',{method:'POST'}).then(async response=>{if(!response.ok)throw new Error();setDiskNotice('Проверка завершена.');}).catch(()=>setDiskNotice('Не удалось проверить папку.'));}}>Проверить сейчас</button></>}<button type="button" disabled={disk.scanning} onClick={()=>{void fetch('/api/yandex/disconnect',{method:'POST'}).then(async r=>{if(!r.ok) throw new Error((await r.json()).error);setDisk({connected:false});setMeetings(old=>old.filter(x=>!x.id.startsWith('yandex:')));setDiskNotice('Диск отключён, серверные настройки и результаты удалены. Доступ приложения можно отозвать также в Яндекс ID.');}).catch(e=>setDiskNotice(e.message));}}>Отключить Диск</button>{disk.lastChecked&&<p>Последняя проверка: {new Date(disk.lastChecked).toLocaleString('ru-RU')}</p>}{disk.lastError&&<p className="error">{disk.lastError}</p>}{diskNotice&&<p role="status">{diskNotice}</p>}</>}</div><div className="sideHead"><h2>Ваши встречи</h2><span>{meetings.length}</span></div><button className="upload" disabled={busy} onClick={()=>picker.current?.click()}><strong>＋</strong><span>{busy?'Обрабатываем запись':'Загрузить видео'}<small>MP4 или WebM · до 200 МБ</small></span></button><input ref={picker} type="file" accept=".mp4,.webm,video/mp4,video/webm" hidden onChange={e=>void handle(e.target.files?.[0])}/><form className="cloudBox" onSubmit={e=>{e.preventDefault();void handle(undefined,cloudUrl);}}><label htmlFor="cloud-url">Ссылка на видеозапись</label><input id="cloud-url" type="url" placeholder="https://drive.google.com/file/d/…" value={cloudUrl} onChange={e=>setCloudUrl(e.target.value)} required disabled={busy}/><button type="submit" disabled={busy}>Добавить из облака</button><p>Google Drive: откройте доступ по ссылке для скачивания.</p></form><p className="hint"><strong>Максимальный размер файла: 200 МБ.</strong><br/>Форматы: MP4 и WebM. Рекомендуем записи на 2–5 минут. Загружайте запись с согласия участников.</p>{notice&&<p className="error" role="alert">{notice}</p>}
+    <div className="list">{meetings.map(m=><button key={m.id} className={'meeting '+(selected===m.id?'active':'')} onClick={()=>setSelected(m.id)}><span className="fileIcon">▤</span><span className="meetingText"><strong title={m.name}>{m.name}</strong><small>{new Date(m.createdAt).toLocaleString('ru-RU',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})} · {m.source==='yandex'?'Яндекс Диск':m.source==='cloud'?'Из облака':'Загружено вручную'} · {m.status==='processing' ? ({fetching:'Получение файла',transcribing:'Распознавание речи',analyzing:'AI-анализ'}[m.stage || 'fetching']) : label[m.status]}</small></span><span className={'dot '+m.status} title={label[m.status]} /></button>)}</div><p className="privacy">Обычная история хранится в этом браузере. История Яндекс Диска хранится на сервере и доступна в этом браузере.</p></aside>
+    <article>{!current?<div className="empty"><div className="emptyIcon">✳</div><h2>Здесь будет ваша встреча</h2><p>Выберите видео или подключите Яндекс Диск, и мы подготовим всё самое важное.</p></div>:<><div className="resultHead"><div><p className="eyebrow">ВАША ВСТРЕЧА</p><h2>{current.name}</h2><p>{new Date(current.createdAt).toLocaleString('ru-RU')} · {current.source==='yandex'?'Яндекс Диск':current.source==='cloud'?'Из облака':'Загружено вручную'}</p></div><span className={'status '+current.status}>{current.status==='processing' ? ({fetching:'Получение файла',transcribing:'Распознавание речи',analyzing:'AI-анализ'}[current.stage || 'fetching']) : label[current.status]}</span></div>{current.status==='processing'&&<div className="empty"><div className="spinner"/><h2>Готовим конспект</h2><p>{current.source==='yandex'?'Запись обрабатывается на сервере. Можно закрыть страницу.':'Это может занять несколько минут. Пожалуйста, не закрывайте страницу.'}</p></div>}{current.status==='error'&&<div className="errorBox"><h3>Не получилось обработать запись</h3><p>{current.error}</p><button onClick={()=>picker.current?.click()} disabled={busy}>Загрузить файл повторно</button></div>}{current.status==='done'&&current.notes&&<div className="result"><section className="summary"><p className="eyebrow">САМОЕ ГЛАВНОЕ</p><h3>Краткое содержание</h3><p>{current.notes.summary}</p></section><div className="notesGrid"><Section title="Решения" items={current.notes.decisions}/><Section title="Задачи" items={current.notes.tasks}/><Section title="Открытые вопросы" items={current.notes.questions}/></div><details><summary>Расшифровка встречи <span>⌄</span></summary><p className="transcript">{current.transcript}</p></details></div>}</>}</article></div><footer>Создано для осмысленных встреч <span>✳</span></footer></main>
+}
